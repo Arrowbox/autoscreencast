@@ -1,0 +1,442 @@
+#!/bin/bash
+docstring="Usage: $0 ...
+    -d <dirname>: Specify directory
+    -w <window id>: Specify window, if not specified, it will be selected interactively
+    -n <name>: Basename for asciicast, video and script, defaults to directory name
+    -a <asciicast>: Asciicast name, overrides basename
+    -v <video file>: Video file name, overrides basename
+    -s <script>: Script file name, overrides basename
+    -z: Transcode to smaller file after completion
+    -y: Overwrite by default
+    -q: Suppress output
+"
+
+
+# Pulled from sysexits.h
+EX_USAGE=64         # command line usage error
+EX_DATAERR=65       # data format error
+EX_NOINPUT=66       # cannot open input
+EX_NOUSER=67        # addressee unknown
+EX_NOHOST=68        # host name unknown
+EX_UNAVAILABLE=69   # service unavailable
+EX_SOFTWARE=70      # internal software error
+EX_OSERR=71         # system error (e.g., can't fork)
+EX_OSFILE=72        # critical OS file missing
+EX_CANTCREAT=73     # can't create (user) output file
+EX_IOERR=74         # input/output error
+EX_TEMPFAIL=75      # temp failure; user is invited to retry
+EX_PROTOCOL=76      # remote error in protocol
+EX_NOPERM=77        # permission denied
+EX_CONFIG=78        # configuration error
+
+verbose_output() {
+    local verbose=$1
+    shift 1
+
+    if [ $verbose -ne 0 ]; then
+        echo >&2 "$@"
+    fi
+}
+
+check_command() {
+    local v=$1
+    shift 1
+
+    verbose_output $v -n "Checking $1"
+    command -v $1 >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        verbose_output $v "missing, please install"
+        exit $EX_OSFILE
+    else
+        verbose_output $v "found"
+    fi
+}
+
+default_filename() {
+    # Usage: default_filename <verbose> <basedir var> <name var> <output var> <extension>
+    #   <verbose>: Output information to stderr
+    #   <basedir var>: Name a variable containing base dir name
+    #   <name var>: Name of variable containing name
+    #   <output var>: Name of variable to assign result to
+    #   <extension>: File extension to append
+    # Filename defaults in the following order:
+    #   1. Name passed in by cli
+    #   2. Name passed in as the -n <name> arg
+    #   3. Name passed in as the -d <dir> arg
+    #   4. Current directory name
+    # The filename is then concatenated with
+    # a directory name in the following order:
+    #   1. None, if the filename is an absolute path
+    #   2. Directory passed in as the -d <dir> arg
+    #   3. Current directory
+
+    local v=$1
+    shift 1
+
+    local -n recdir=$1
+    local -n recname=$2
+    local -n recvar=$3
+    local varname=$3
+    local extension=$4
+
+    if [ -z "$recvar" ]; then
+        if [ -n  "$recname" ]; then
+            recvar=$recname
+        elif [ -n "$recdir" ]; then
+            recvar=${recdir##*/}
+        else
+            recvar=${PWD##*/}
+        fi
+    fi
+
+    # Check if the directory of the name is available
+    if [ ! -d ${recvar##*/} ]; then
+        if [ -n "$recdir" ]; then
+            recvar="$recdir/$recvar"
+        else
+            recvar="${PWD}/$recvar"
+        fi
+    fi
+
+    if [ -n "$extension" ]; then
+        if [[ ! "$recvar" == "*.$extension" ]]; then
+            recvar=$recvar.$extension
+        fi
+    fi
+
+    verbose_output $v "$3 is set to $recvar"
+}
+
+check_output_file() {
+    local v=$1
+    local overwrite=$2
+    shift 2
+
+    local -n filename=$1
+
+    if [ -f $filename ]; then
+        if [ $overwrite -eq 0 ]; then
+            verbose_output $v "Output: $filename exists, refusing to overwrite"
+            exit $EX_IOERR
+        else
+            verbose_output $v "Output: $filename exists, will be overwritten"
+        fi
+    else
+        verbose_output $v "Output: $filename will be created"
+    fi
+}
+
+check_input_file() {
+    local v=$1
+    shift 1
+
+    local -n filename=$1
+
+    if [ ! -f $filename ]; then
+        verbose_output $v "Input: $filename is missing"
+        exit $EX_IOERR
+    fi
+
+    verbose_output $v "Input: $filename found"
+}
+
+select_window() {
+    local v=$1
+    shift 1
+
+    local -n window=$1
+
+    if [ -z $window ]; then
+        verbose_output $v "Please select a window to record"
+        window=$(xdotool selectwindow)
+    fi
+
+    verbose_output $v "Selected window id: $window"
+}
+
+dimensions() {
+    local v=$1
+    shift 1
+
+    id=$1
+    local -n x=$2
+    local -n y=$3
+    local -n width=$4
+    local -n height=$5
+
+    info="$(xwininfo -id $id)"
+
+    x=$(echo "$info" | awk '/Absolute upper-left X/ {print $4}')
+    y=$(echo "$info" | awk '/Absolute upper-left Y/ {print $4}')
+    width=$(echo "$info" | awk '/Width/ {print $2}')
+    height=$(echo "$info" | awk '/Height/ {print $2}')
+
+    verbose_output $v "Dimensions: ${width}x${height}+${x}+${y}"
+}
+
+start_screenkey() {
+    local v=$1
+    shift 1
+
+    local -n pid=$1
+    local x=$2
+    local y=$3
+    local width=$4
+    local height=$5
+    local opacity=$6
+
+    if [ -z $opacity ]; then
+        opacity=0.1
+    fi
+
+    verbose_output $v -n "Starting screenkey..."
+    screenkey -g "${width}x${height}+${x}+${y}" --opacity "$opacity" --no-systray &> /dev/null &
+    pid=$!
+    sleep 2
+    toggle_screenkey 0
+    verbose_output $v "done. PID: $pid"
+}
+
+stop_screenkey() {
+    local v=$1
+    shift 1
+
+    local pid=$1
+
+    verbose_output $v -n "Stopping screenkey..."
+    kill $pid &> /dev/null
+    sleep 1
+    verbose_output $v "done."
+}
+
+start_asciicast() {
+    local v=$1
+    shift 1
+
+    local window=$1
+    local output=$2
+
+    verbose_output $v -n "Starting asciicast..."
+    xdotool windowfocus --sync $window
+    xdotool type "asciinema rec -c 'clear && zsh' -q $output"
+    xdotool key 'Return'
+    sleep 1
+    verbose_output $v "done."
+}
+
+stop_asciicast() {
+    local v=$1
+    shift 1
+
+    local window=$1
+
+    verbose_output $v -n "Stopping asciicast..."
+    xdotool windowfocus --sync $window
+    xdotool key 'ctrl+d'
+    verbose_output $v "done."
+}
+
+start_ffmpeg() {
+    local v=$1
+    shift 1
+
+    local -n pid=$1
+    local x=$2
+    local y=$3
+    local width=$4
+    local height=$5
+    local output=$6
+
+    verbose_output $v -n "Starting ffmpeg..."
+    ffmpeg -s ${width}x${height} -r 25 -f x11grab -draw_mouse 0 -i :0.0+${x},${y} -vcodec libx264 -preset ultrafast -threads 0 -y -nostats -loglevel 0 $output &
+    pid=$!
+    verbose_output $v "done. PID: $pid"
+}
+
+stop_ffmpeg() {
+    local v=$1
+    shift 1
+
+    local pid=$1
+
+    verbose_output $v -n "Stopping ffmpeg..."
+    kill $pid &>/dev/null
+    sleep 1
+    verbose_output $v "done."
+}
+
+transcode_ffmpeg() {
+    local v=$1
+    shift 1
+
+    original=$1
+    shrunk=${original/.mp4/_shrunk.mp4}
+    verbose_output $v "Transcoding $original to $shrunk"
+    ffmpeg -y -nostart -loglevel 0 -i $original $shrunk
+}
+
+
+toggle_screenkey() {
+    local v=$1
+    shift 1
+
+    verbose_output $v "Toggling screenkey"
+    xdotool keydown 'Control_L+Control_R'
+    xdotool sleep .5
+    xdotool keyup 'Control_L+Control_R'
+    xdotool sleep .5
+}
+
+send_command() {
+    local v=$1
+    shift 1
+
+    local window=$1
+    shift 1
+
+    verbose_output $v "Sending: '$@'"
+    xdotool windowfocus --sync $window
+    xdotool type --delay 200 "$@"
+    xdotool key 'Return'
+}
+
+send_key() {
+    local v=$1
+    shift 1
+
+    local window=$1
+    shift 1
+
+    verbose_output $v "Sending: $@"
+    xdotool windowfocus --sync $window
+    toggle_screenkey $v
+    xdotool key --delay 200 $@
+    toggle_screenkey $v
+}
+
+send_sleep() {
+    local v=$1
+    shift 1
+
+    local window=$1
+    shift 1
+
+    verbose_output $v "Sleeping for $@"
+    xdotool windowfocus --sync $window
+    xdotool sleep $@
+}
+
+wait_for_continue() {
+    local v=$1
+    shift 1
+
+    local script_window=$1
+    local rec_window=$2
+    local fd=$3
+
+    if [ -z "$fd" ]; then
+        fd=0
+    fi
+
+    verbose_output $v "Pausing for commentary"
+    xdotool windowfocus --sync $script_window
+    read -p "Press enter to continue" <&$fd
+    xdotool windowfocus --sync $rec_window
+}
+
+
+# Make sure we don't leave xdotool around with
+# one of the control keys potentially pushed
+cleanup() {
+    pkill -f xdotool &> /dev/null
+    pkill -f screenkey &> /dev/null
+}
+trap cleanup EXIT
+
+VERBOSE=1
+OVERWRITE=0
+TRANSCODE=0
+
+while getopts ":h?d:w:n:a:v:s:qyz" opt; do
+    case $opt in
+        d) RECDIR=$OPTARG;;
+        w) RECWIN=$OPTARG;;
+        n) RECNAME=$OPTARG;;
+        a) RECASCII=$OPTARG;;
+        v) RECVIDEO=$OPTARG;;
+        s) RECSCRIPT=$OPTARG;;
+        z) TRANSCODE=1;;
+        q) VERBOSE=0;;
+        y) OVERWRITE=1;;
+        h)
+            echo "$docstring"
+            exit
+            ;;
+        \?)
+            echo "Invalid option -$OPTARG" >&2
+            echo "$docstring"
+            exit $EX_USAGE
+            ;;
+    esac
+done
+
+
+check_command $VERBOSE asciinema
+check_command $VERBOSE ffmpeg
+check_command $VERBOSE screenkey
+check_command $VERBOSE xdotool
+check_command $VERBOSE xwininfo
+
+default_filename $VERBOSE RECDIR RECNAME RECASCII json
+default_filename $VERBOSE RECDIR RECNAME RECVIDEO  mp4
+default_filename $VERBOSE RECDIR RECNAME RECSCRIPT md
+
+check_output_file $VERBOSE $OVERWRITE RECASCII
+check_output_file $VERBOSE $OVERWRITE RECVIDEO
+
+check_input_file $VERBOSE RECSCRIPT
+
+SCRIPTWIN=$(xdotool getactivewindow)
+verbose_output $VERBOSE "Script Window ID: $SCRIPTWIN"
+
+select_window $VERBOSE RECWIN
+
+dimensions $VERBOSE $RECWIN X Y WIDTH HEIGHT
+
+start_screenkey $VERBOSE SCREENKEY_PID $X $Y $WIDTH $HEIGHT
+start_asciicast $VERBOSE $RECWIN $RECASCII
+start_ffmpeg $VERBOSE FFMPEG_PID $X $Y $WIDTH $HEIGHT $RECVIDEO
+
+lines="$(awk 'BEGIN {show=0; start=0}
+             /```/ {show = !show; start=1;}
+             {if (show && !start) print; else start=0;}' $RECSCRIPT)"
+
+exec 3<&0
+echo "$lines" | while read cmd; do
+    case $cmd in
+        command*)
+            send_command $VERBOSE $RECWIN "${cmd#command }"
+            ;;
+        keypress*)
+            send_key $VERBOSE $RECWIN ${cmd#keypress }
+            ;;
+        toggle)
+            toggle_screenkey $VERBOSE
+            ;;
+        sleep*)
+            send_sleep $VERBOSE $RECWIN "${cmd#sleep }"
+            ;;
+        pause)
+            wait_for_continue $VERBOSE $SCRIPTWIN $RECWIN 3
+            ;;
+    esac
+done
+exec 3<&-
+
+stop_ffmpeg $VERBOSE $FFMPEG_PID
+stop_asciicast $VERBOSE $RECWIN
+stop_screenkey $VERBOSE $SCREENKEY_PID
+
+if [ $TRANSCODE -eq 1 ]; then
+    transcode_ffmpeg $VERBOSE $RECVIDEO
+fi
