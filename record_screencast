@@ -1,11 +1,13 @@
 #!/bin/bash
-docstring="Usage: $0 ...
+docstring="Usage: ${0##*/} [options]
+Options:
     -d <dirname>: Specify directory
     -w <window id>: Specify window, if not specified, it will be selected interactively
     -n <name>: Basename for asciicast, video and script, defaults to directory name
     -a <asciicast>: Asciicast name, overrides basename
     -v <video file>: Video file name, overrides basename
     -s <script>: Script file name, overrides basename
+    -p: Autopause the script when entering a command block
     -z: Transcode to smaller file after completion
     -y: Overwrite by default
     -q: Suppress output
@@ -99,7 +101,10 @@ default_filename() {
     fi
 
     if [ -n "$extension" ]; then
-        if [[ ! "$recvar" == "*.$extension" ]]; then
+        verbose_output $v "Recvar: $recvar"
+        verbose_output $v "Recvar without extension: ${recvar%.$extension}"
+
+        if [[ "$recvar" == "${recvar%.$extension}" ]]; then
             recvar=$recvar.$extension
         fi
     fi
@@ -140,18 +145,22 @@ check_input_file() {
     verbose_output $v "Input: $filename found"
 }
 
-select_window() {
+select_windows() {
     local v=$1
     shift 1
 
     local -n window=$1
+    local -n script=$2
+
+    script=$(xdotool getactivewindow)
 
     if [ -z $window ]; then
         verbose_output $v "Please select a window to record"
         window=$(xdotool selectwindow)
     fi
 
-    verbose_output $v "Selected window id: $window"
+    verbose_output $v "Script window id: $script"
+    verbose_output $v "Record window id: $window"
 }
 
 dimensions() {
@@ -215,10 +224,15 @@ start_asciicast() {
 
     local window=$1
     local output=$2
+    local shell=$3
+
+    if [ -z "$shell" ]; then
+        shell=$SHELL
+    fi
 
     verbose_output $v -n "Starting asciicast..."
     xdotool windowfocus --sync $window
-    xdotool type "asciinema rec -c 'clear && zsh' -q $output"
+    xdotool type "asciinema rec -c 'clear && '"$shell"'' -q $output"
     xdotool key 'Return'
     sleep 1
     verbose_output $v "done."
@@ -275,6 +289,27 @@ transcode_ffmpeg() {
     ffmpeg -y -nostart -loglevel 0 -i $original $shrunk
 }
 
+process_script() {
+    local v=$1
+    shift 1
+
+    local -n output=$1
+    local script=$2
+    local autopause=$3
+
+    verbose_output $v -n "Processing ${script##*/} with autopause "
+    begin='BEGIN {show=0; start=0}'
+    start='/```/ {show = !show; start=1}'
+    if [ $autopause -eq 0 ]; then
+        verbose_output $v "disabled"
+        print='{if (show && !start) print; else start=0;}'
+    else
+        verbose_output $v "enabled"
+        print='{if (show) { if(!start) print; else {start=0; print "pause";}}}'
+    fi
+
+    output="$(awk "$begin $start $print" $script)"
+}
 
 toggle_screenkey() {
     local v=$1
@@ -282,7 +317,7 @@ toggle_screenkey() {
 
     verbose_output $v "Toggling screenkey"
     xdotool keydown 'Control_L+Control_R'
-    xdotool sleep .5
+    xdotool sleep .
     xdotool keyup 'Control_L+Control_R'
     xdotool sleep .5
 }
@@ -340,7 +375,7 @@ wait_for_continue() {
 
     verbose_output $v "Pausing for commentary"
     xdotool windowfocus --sync $script_window
-    read -p "Press enter to continue" <&$fd
+    read -p "Paused, press enter to continue" <&$fd
     xdotool windowfocus --sync $rec_window
 }
 
@@ -356,8 +391,9 @@ trap cleanup EXIT
 VERBOSE=1
 OVERWRITE=0
 TRANSCODE=0
+AUTOPAUSE=0
 
-while getopts ":h?d:w:n:a:v:s:qyz" opt; do
+while getopts ":h?d:w:n:a:v:s:qypz" opt; do
     case $opt in
         d) RECDIR=$OPTARG;;
         w) RECWIN=$OPTARG;;
@@ -365,6 +401,7 @@ while getopts ":h?d:w:n:a:v:s:qyz" opt; do
         a) RECASCII=$OPTARG;;
         v) RECVIDEO=$OPTARG;;
         s) RECSCRIPT=$OPTARG;;
+        p) AUTOPAUSE=1;;
         z) TRANSCODE=1;;
         q) VERBOSE=0;;
         y) OVERWRITE=1;;
@@ -396,10 +433,7 @@ check_output_file $VERBOSE $OVERWRITE RECVIDEO
 
 check_input_file $VERBOSE RECSCRIPT
 
-SCRIPTWIN=$(xdotool getactivewindow)
-verbose_output $VERBOSE "Script Window ID: $SCRIPTWIN"
-
-select_window $VERBOSE RECWIN
+select_windows $VERBOSE RECWIN SCRIPTWIN
 
 dimensions $VERBOSE $RECWIN X Y WIDTH HEIGHT
 
@@ -407,18 +441,16 @@ start_screenkey $VERBOSE SCREENKEY_PID $X $Y $WIDTH $HEIGHT
 start_asciicast $VERBOSE $RECWIN $RECASCII
 start_ffmpeg $VERBOSE FFMPEG_PID $X $Y $WIDTH $HEIGHT $RECVIDEO
 
-lines="$(awk 'BEGIN {show=0; start=0}
-             /```/ {show = !show; start=1;}
-             {if (show && !start) print; else start=0;}' $RECSCRIPT)"
+process_script $VERBOSE COMMANDS $RECSCRIPT $AUTOPAUSE
 
 exec 3<&0
-echo "$lines" | while read cmd; do
+echo "$COMMANDS" | while read cmd; do
     case $cmd in
         command*)
             send_command $VERBOSE $RECWIN "${cmd#command }"
             ;;
-        keypress*)
-            send_key $VERBOSE $RECWIN ${cmd#keypress }
+        key*)
+            send_key $VERBOSE $RECWIN ${cmd#key }
             ;;
         toggle)
             toggle_screenkey $VERBOSE
@@ -426,7 +458,7 @@ echo "$lines" | while read cmd; do
         sleep*)
             send_sleep $VERBOSE $RECWIN "${cmd#sleep }"
             ;;
-        pause)
+        pause*)
             wait_for_continue $VERBOSE $SCRIPTWIN $RECWIN 3
             ;;
     esac
