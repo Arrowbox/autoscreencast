@@ -7,6 +7,7 @@ Options:
     -a <asciicast>: Asciicast name, overrides basename
     -v <video file>: Video file name, overrides basename
     -s <script>: Script file name, overrides basename
+    -t <shell>: Shell to use, defaults to login shell
     -p: Autopause the script when entering a command block
     -z: Transcode to smaller file after completion
     -y: Overwrite by default
@@ -199,7 +200,7 @@ start_screenkey() {
     fi
 
     verbose_output $v -n "Starting screenkey..."
-    screenkey -g "${width}x${height}+${x}+${y}" --opacity "$opacity" --no-systray &> /dev/null &
+    screenkey -g "${width}x${height}+${x}+${y}" --opacity "$opacity" --no-systray --vis-shift &> /dev/null &
     pid=$!
     sleep 2
     toggle_screenkey 0
@@ -232,7 +233,8 @@ start_asciicast() {
 
     verbose_output $v -n "Starting asciicast..."
     xdotool windowfocus --sync $window
-    xdotool type "asciinema rec -c 'clear && '"$shell"'' -q $output"
+    # Prepend spaces to exclude this command from the shell history
+    xdotool type "   asciinema rec -c 'clear && '"$shell"'' -q $output"
     xdotool key 'Return'
     sleep 1
     verbose_output $v "done."
@@ -287,6 +289,16 @@ transcode_ffmpeg() {
     shrunk=${original/.mp4/_shrunk.mp4}
     verbose_output $v "Transcoding $original to $shrunk"
     ffmpeg -y -nostart -loglevel 0 -i $original $shrunk
+}
+
+transcode_gif_ffmpeg() {
+    local v=$1
+    shift 1
+
+    original=$1
+    gif=${original/.mp4/.gif}
+    verbose_output $v "Transcoding $original to $gif"
+    ffmpeg -y -loglevel 0 -i $original -filter_complex "[0:v] fps=12,scale=480:-1,split [a][b];[a] palettegen [p];[b][p] paletteuse" $gif
 }
 
 process_script() {
@@ -393,7 +405,7 @@ OVERWRITE=0
 TRANSCODE=0
 AUTOPAUSE=0
 
-while getopts ":h?d:w:n:a:v:s:qypz" opt; do
+while getopts ":h?d:w:n:a:v:s:t:qypz" opt; do
     case $opt in
         d) RECDIR=$OPTARG;;
         w) RECWIN=$OPTARG;;
@@ -401,6 +413,7 @@ while getopts ":h?d:w:n:a:v:s:qypz" opt; do
         a) RECASCII=$OPTARG;;
         v) RECVIDEO=$OPTARG;;
         s) RECSCRIPT=$OPTARG;;
+	t) RECSHELL=$OPTARG;;
         p) AUTOPAUSE=1;;
         z) TRANSCODE=1;;
         q) VERBOSE=0;;
@@ -438,7 +451,7 @@ select_windows $VERBOSE RECWIN SCRIPTWIN
 dimensions $VERBOSE $RECWIN X Y WIDTH HEIGHT
 
 start_screenkey $VERBOSE SCREENKEY_PID $X $Y $WIDTH $HEIGHT
-start_asciicast $VERBOSE $RECWIN $RECASCII
+start_asciicast $VERBOSE $RECWIN $RECASCII $RECSHELL
 start_ffmpeg $VERBOSE FFMPEG_PID $X $Y $WIDTH $HEIGHT $RECVIDEO
 
 process_script $VERBOSE COMMANDS $RECSCRIPT $AUTOPAUSE
@@ -466,6 +479,7 @@ done
 exec 3<&-
 
 stop_ffmpeg $VERBOSE $FFMPEG_PID
+transcode_gif_ffmpeg $VERBOSE $RECVIDEO
 stop_asciicast $VERBOSE $RECWIN
 stop_screenkey $VERBOSE $SCREENKEY_PID
 
