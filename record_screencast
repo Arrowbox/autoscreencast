@@ -1,4 +1,6 @@
 #!/bin/bash
+set -euo pipefail
+
 docstring="Usage: ${0##*/} [options]
 Options:
     -d <dirname>: Specify directory
@@ -7,6 +9,7 @@ Options:
     -a <asciicast>: Asciicast name, overrides basename
     -v <video file>: Video file name, overrides basename
     -s <script>: Script file name, overrides basename
+    -t <shell>: Shell to use, defaults to login shell
     -p: Autopause the script when entering a command block
     -z: Transcode to smaller file after completion
     -y: Overwrite by default
@@ -44,7 +47,7 @@ check_command() {
     local v=$1
     shift 1
 
-    verbose_output $v -n "Checking $1"
+    verbose_output $v -n "Checking $1: "
     command -v $1 >/dev/null 2>&1
     if [ $? -ne 0 ]; then
         verbose_output $v "missing, please install"
@@ -77,11 +80,11 @@ default_filename() {
 
     local -n recdir=$1
     local -n recname=$2
-    local -n recvar=$3
-    local varname=$3
-    local extension=$4
+    local -n recvar=${3:-}
+    local varname=${3:-}
+    local extension=${4:-}
 
-    if [ -z "$recvar" ]; then
+    if [ ! -v recvar ] || [ -z "$recvar" ]; then
         if [ -n  "$recname" ]; then
             recvar=$recname
         elif [ -n "$recdir" ]; then
@@ -93,7 +96,7 @@ default_filename() {
 
     # Check if the directory of the name is available
     if [ ! -d ${recvar##*/} ]; then
-        if [ -n "$recdir" ]; then
+        if [ -v recdir ] && [ -n "$recdir" ]; then
             recvar="$recdir/$recvar"
         else
             recvar="${PWD}/$recvar"
@@ -154,7 +157,7 @@ select_windows() {
 
     script=$(xdotool getactivewindow)
 
-    if [ -z $window ]; then
+    if [ ! -v window ] || [ -z $window ]; then
         verbose_output $v "Please select a window to record"
         window=$(xdotool selectwindow)
     fi
@@ -192,14 +195,14 @@ start_screenkey() {
     local y=$3
     local width=$4
     local height=$5
-    local opacity=$6
+    local opacity=${6:-}
 
     if [ -z $opacity ]; then
         opacity=0.1
     fi
 
     verbose_output $v -n "Starting screenkey..."
-    screenkey -g "${width}x${height}+${x}+${y}" --opacity "$opacity" --no-systray &> /dev/null &
+    screenkey -g "${width}x${height}+${x}+${y}" --opacity "$opacity" --no-systray --vis-shift &> /dev/null &
     pid=$!
     sleep 2
     toggle_screenkey 0
@@ -225,14 +228,20 @@ start_asciicast() {
     local window=$1
     local output=$2
     local shell=$3
+    local flags=""
 
     if [ -z "$shell" ]; then
         shell=$SHELL
     fi
 
+    if [ -v OVERWRITE ] && [ -n $OVERWRITE ] ; then
+        flags="${flags} --overwrite"
+    fi
+
     verbose_output $v -n "Starting asciicast..."
     xdotool windowfocus --sync $window
-    xdotool type "asciinema rec -c 'clear && '"$shell"'' -q $output"
+    # Prepend spaces to exclude this command from the shell history
+    xdotool type "   asciinema rec ${flags} -c 'clear && '"$shell"'' -q $output"
     xdotool key 'Return'
     sleep 1
     verbose_output $v "done."
@@ -286,7 +295,29 @@ transcode_ffmpeg() {
     original=$1
     shrunk=${original/.mp4/_shrunk.mp4}
     verbose_output $v "Transcoding $original to $shrunk"
-    ffmpeg -y -nostart -loglevel 0 -i $original $shrunk
+    ffmpeg -y -nostats -loglevel 0 -i $original $shrunk
+}
+
+transcode_gif_ffmpeg() {
+    local v=$1
+    shift 1
+
+    original=$1
+    gif=${original/.mp4/.gif}
+    verbose_output $v "Transcoding $original to $gif"
+    ffmpeg -y -loglevel 0 -i $original -filter_complex "[0:v] fps=12,scale=480:-1,split [a][b];[a] palettegen [p];[b][p] paletteuse" $gif
+}
+
+transcode_webp_ffmpeg() {
+    local v=$1
+    shift 1
+
+    original=$1
+    webp=${original/.mp4/.webp}
+    verbose_output $v "Transcoding $original to $webp"
+    ffmpeg -y -loglevel 0 -i $original -vcodec libwebp -filter:v fps=fps=20 \
+      -lossless 0 -compression_level 9 -q:v 70 -loop 1 -preset picture -an \
+      -vsync 0 -s 800:600 $webp
 }
 
 process_script() {
@@ -383,8 +414,10 @@ wait_for_continue() {
 # Make sure we don't leave xdotool around with
 # one of the control keys potentially pushed
 cleanup() {
+    set +e
     pkill -f xdotool &> /dev/null
     pkill -f screenkey &> /dev/null
+    set -e
 }
 trap cleanup EXIT
 
@@ -393,7 +426,7 @@ OVERWRITE=0
 TRANSCODE=0
 AUTOPAUSE=0
 
-while getopts ":h?d:w:n:a:v:s:qypz" opt; do
+while getopts ":h?d:w:n:a:v:s:t:qypz" opt; do
     case $opt in
         d) RECDIR=$OPTARG;;
         w) RECWIN=$OPTARG;;
@@ -401,6 +434,7 @@ while getopts ":h?d:w:n:a:v:s:qypz" opt; do
         a) RECASCII=$OPTARG;;
         v) RECVIDEO=$OPTARG;;
         s) RECSCRIPT=$OPTARG;;
+	t) RECSHELL=$OPTARG;;
         p) AUTOPAUSE=1;;
         z) TRANSCODE=1;;
         q) VERBOSE=0;;
@@ -438,7 +472,7 @@ select_windows $VERBOSE RECWIN SCRIPTWIN
 dimensions $VERBOSE $RECWIN X Y WIDTH HEIGHT
 
 start_screenkey $VERBOSE SCREENKEY_PID $X $Y $WIDTH $HEIGHT
-start_asciicast $VERBOSE $RECWIN $RECASCII
+start_asciicast $VERBOSE $RECWIN $RECASCII $RECSHELL
 start_ffmpeg $VERBOSE FFMPEG_PID $X $Y $WIDTH $HEIGHT $RECVIDEO
 
 process_script $VERBOSE COMMANDS $RECSCRIPT $AUTOPAUSE
@@ -469,6 +503,8 @@ stop_ffmpeg $VERBOSE $FFMPEG_PID
 stop_asciicast $VERBOSE $RECWIN
 stop_screenkey $VERBOSE $SCREENKEY_PID
 
-if [ $TRANSCODE -eq 1 ]; then
+if [ -v TRANSCODE ] && [ $TRANSCODE -eq 1 ]; then
     transcode_ffmpeg $VERBOSE $RECVIDEO
+    transcode_gif_ffmpeg $VERBOSE $RECVIDEO
+    transcode_webp_ffmpeg $VERBOSE $RECVIDEO
 fi
